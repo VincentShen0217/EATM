@@ -1,0 +1,309 @@
+import torch
+import torch.nn.functional as F
+import numpy as np
+import math
+from data import get_batch
+from pathlib import Path
+from gensim.models.fasttext import FastText as FT_gensim
+from utils import nearest_neighbors, get_topic_coherence, get_topic_diversity
+
+from torch import nn, optim
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+class EATM(nn.Module):
+    def __init__(self, num_topics, vocab_size, t_hidden_size, rho_size, emsize,
+                 x_num_classes, theta_act, embeddings=None, train_embeddings=True, enc_drop=0.5):
+        super(EATM, self).__init__()
+
+        # define hyperparameters
+        self.num_topics = num_topics  # K
+        self.vocab_size = vocab_size  # V
+        self.x_num_classes = x_num_classes  # num of authors
+        self.t_hidden_size = t_hidden_size
+        self.rho_size = rho_size  # L
+        self.enc_drop = enc_drop
+        self.emsize = emsize  # L
+        self.t_drop = nn.Dropout(enc_drop)
+
+        # define activation function
+        self.theta_act = self.get_activation(theta_act)
+
+        # define the word embedding matrix \rho
+        if train_embeddings:
+            self.rho = nn.Linear(rho_size, vocab_size, bias=False)
+        else:
+            num_embeddings, emsize = embeddings.size()
+            rho = nn.Embedding(num_embeddings, emsize)
+            self.rho = embeddings.clone().float().to(device)
+
+        # define the matrix containing the topic embeddings
+        self.alphas = nn.Linear(rho_size, num_topics, bias=False)
+        # define the matrix containing the author embeddings
+        self.author_alphas = nn.Linear(rho_size, x_num_classes, bias=False)
+
+        print(vocab_size, " THE Vocabulary size is here ")
+
+        # define variational distribution for \theta_{1:D} via amortizartion
+        self.q_theta = nn.Sequential(
+            nn.Linear(vocab_size, t_hidden_size),
+            self.theta_act,
+            nn.Linear(t_hidden_size, t_hidden_size),
+            self.theta_act,
+        )
+        self.bsz_q_theta = nn.Linear(t_hidden_size, x_num_classes, bias=True)
+        self.mu_q_theta = nn.Linear(t_hidden_size, num_topics, bias=True)
+        self.logsigma_q_theta = nn.Linear(t_hidden_size, num_topics, bias=True)
+
+    def get_activation(self, act):
+        if act == 'tanh':
+            act = nn.Tanh()
+        elif act == 'relu':
+            act = nn.ReLU()
+        elif act == 'softplus':
+            act = nn.Softplus()
+        elif act == 'rrelu':
+            act = nn.RReLU()
+        elif act == 'leakyrelu':
+            act = nn.LeakyReLU()
+        elif act == 'elu':
+            act = nn.ELU()
+        elif act == 'selu':
+            act = nn.SELU()
+        elif act == 'glu':
+            act = nn.GLU()
+        else:
+            print('Defaulting to tanh activations...')
+            act = nn.Tanh()
+        return act
+
+    def reparameterize(self, mu, logvar):
+        """
+        Returns a sample from a Gaussian distribution via reparameterization.
+        \delta_d
+        """
+        if self.training:
+            std = torch.exp(0.5 * logvar)
+            eps = torch.randn_like(std)
+            return eps.mul_(std).add_(mu)
+        else:
+            return mu
+
+    def encode(self, bows, input_x):
+        """
+        Returns paramters of the variational distribution for \theta.
+
+        input_x : one-hot vector of authors in size bsz * x_num_classes
+        """
+        input_x = input_x.cpu()
+        x_sum = input_x.sum(1)
+        bsz_theta = [input_x[i] / x_sum[i] for i in range(len(x_sum))]
+        bsz_theta = torch.from_numpy(np.array(bsz_theta)).to(device)
+        # size in bsz_size * x_num_classes
+        return bsz_theta
+
+    def get_beta(self):
+        """
+        This generates the description as a definition over words
+
+        Returns:
+            [type]: [description]
+        """
+        x = np.identity(self.rho_size)
+        x = torch.from_numpy(x).float().to(device)
+        x = self.rho(x)  # size in rho_size * vocab_size
+        logit = self.alphas(x.T)  # size in vocab_size * num_topics
+        beta = F.softmax(logit.T, dim=1)  # softmax over vocab dimension
+        return beta
+
+    def get_phi(self):
+        """
+        This generates the description of authors' interests as a definition over words.
+
+        Returns:
+
+        """
+        x = np.identity(self.rho_size)
+        x = torch.from_numpy(x).float().to(device)
+        x = self.author_alphas(x)  # size in rho_size * x_num_classes
+        logit = self.alphas(x.T)  # size in x_num_classes * num_topics
+        phi = F.softmax(logit, dim=1)  # softmax over topic dimension
+        return phi
+
+    def get_theta(self, input_x):
+        """
+        getting the topic proportion for the document passed in the normalized bow or tf-idf
+        """
+        num_authors = input_x.sum(1)
+        theta = 1./num_authors
+        kld_theta = torch.zeros(self.num_topics).to(device)
+        return theta, kld_theta
+
+    def decode(self, phi, beta):
+        """
+        compute the probability of topic given the document which is equal to theta^T ** B
+
+        Args:
+            theta ([type]): [description]
+            beta ([type]): [description]
+
+        Returns:
+            [type]: [description]
+        """
+        res = torch.mm(phi, beta)  # size in x_num_classes * vocab_size
+        return res
+
+    def forward(self, bows, normalized_bows, input_x, theta=None, aggregate=True):
+        # get \theta
+        if theta is None:
+            theta, kld_theta = self.get_theta(normalized_bows)
+        else:
+            kld_theta = None
+
+        bsz_theta = self.encode(normalized_bows, input_x)
+        beta = self.get_beta()
+        phi = self.get_phi()
+        # get prediction loss
+        res = self.decode(phi, beta)
+        preds = torch.mm(bsz_theta, res)
+        # preds = F.softmax(preds, dim=1)  # softmax over vocabulary dimension
+        almost_zeros = torch.full_like(preds, 1e-6)
+        preds = preds.add(almost_zeros)
+        preds = torch.log(preds)
+        recon_loss = -(preds * bows).sum(1)
+        if aggregate:
+            recon_loss = recon_loss.mean()
+        return recon_loss, kld_theta
+
+    def get_optimizer(self, args):
+        """
+        Get the model default optimizer
+
+        Args:
+            sefl ([type]): [description]
+        """
+        if args.optimizer == 'adam':
+            optimizer = optim.Adam(self.parameters(), lr=args.lr, weight_decay=args.wdecay)
+        elif args.optimizer == 'adagrad':
+            optimizer = optim.Adagrad(self.parameters(), lr=args.lr, weight_decay=args.wdecay)
+        elif args.optimizer == 'adadelta':
+            optimizer = optim.Adadelta(self.parameters(), lr=args.lr, weight_decay=args.wdecay)
+        elif args.optimizer == 'rmsprop':
+            optimizer = optim.RMSprop(self.parameters(), lr=args.lr, weight_decay=args.wdecay)
+        elif args.optimizer == 'asgd':
+            optimizer = optim.ASGD(self.parameters(), lr=args.lr, t0=0, lambd=0., weight_decay=args.wdecay)
+        elif args.optimizer == 'sgd':
+            optimizer = optim.SGD(self.parameters(), lr=args.lr)
+        else:
+            print('Defaulting to vanilla SGD')
+            optimizer = optim.SGD(self.parameters(), lr=args.lr)
+        self.optimizer = optimizer
+        return optimizer
+
+    def train_for_epoch(self, epoch, args, training_set, input_x):
+        """
+        train the model for the given epoch
+
+        Args:
+            epoch ([type]): [description]
+        """
+        self.train()
+        acc_loss = 0
+        acc_kl_theta_loss = 0
+        cnt = 0
+        number_of_docs = torch.randperm(args.num_docs_train)
+        batch_indices = torch.split(number_of_docs, args.batch_size)
+        print("The number of the indices I am using for the training is ", len(batch_indices))
+        for idx, indices in enumerate(batch_indices):
+            print("Running for ", idx)
+            self.optimizer.zero_grad()
+            self.zero_grad()
+            data_batch = get_batch(training_set, indices, device)
+            author_batch = get_batch(input_x, indices, device)
+            normalized_data_batch = data_batch
+            recon_loss, kld_theta = self.forward(data_batch, normalized_data_batch, author_batch)
+            total_loss = recon_loss
+            total_loss.backward()
+            if args.clip > 0:
+                torch.nn.utils.clip_grad_norm_(self.parameters(), args.clip)
+            self.optimizer.step()
+
+            acc_loss += torch.sum(recon_loss).item()
+            acc_kl_theta_loss += torch.sum(kld_theta).item()
+            cnt += 1
+            if idx % args.log_interval == 0 and idx > 0:
+                cur_loss = round(acc_loss / cnt, 2)
+                cur_kl_theta = round(acc_kl_theta_loss / cnt, 2)
+                cur_real_loss = round(cur_loss + cur_kl_theta, 2)
+
+                print('Epoch: {} .. batch: {}/{} .. LR: {} .. KL_theta: {} .. Rec_loss: {} .. NELBO: {}'.format(
+                    epoch, idx, len(indices), self.optimizer.param_groups[0]['lr'], cur_kl_theta, cur_loss,
+                    cur_real_loss))
+
+        cur_loss = round(acc_loss / cnt, 2)
+        cur_kl_theta = round(acc_kl_theta_loss / cnt, 2)
+        cur_real_loss = round(cur_loss + cur_kl_theta, 2)
+        print('*' * 100)
+        print('Epoch----->{} .. LR: {} .. KL_theta: {} .. Rec_loss: {} .. NELBO: {}'.format(
+            epoch, self.optimizer.param_groups[0]['lr'], cur_kl_theta, cur_loss, cur_real_loss))
+        print('*' * 100)
+        return cur_loss
+
+    def evaluate(self, args, source, training_set, input_x, vocabulary, test_1, test_2, test_a1, test_a2, tc=False, td=False):
+        """
+        Compute perplexity on document completion.
+        """
+        self.eval()
+        with torch.no_grad():
+            if source == 'val':
+                indices = torch.split(torch.tensor(range(args.num_docs_valid)), args.eval_batch_size)
+            else:
+                indices = torch.split(torch.tensor(range(args.num_docs_test)), args.eval_batch_size)
+
+            # get \beta here
+            beta = self.get_beta()
+            phi = self.get_phi()
+
+            # do dc and tc here
+            acc_loss = 0
+            cnt = 0
+            indices_1 = torch.split(torch.tensor(range(args.num_docs_test_1)), args.eval_batch_size)
+            for idx, indice in enumerate(indices_1):
+                data_batch_1 = get_batch(test_1, indice, device)
+                test_abatch_1 = get_batch(test_a1, indice, device)
+                sums_1 = data_batch_1.sum(1).unsqueeze(1)
+                if args.bow_norm:
+                    normalized_data_batch_1 = data_batch_1 / sums_1
+                else:
+                    normalized_data_batch_1 = data_batch_1
+                theta, _ = self.get_theta(normalized_data_batch_1)
+                bsz_theta = self.encode(normalized_data_batch_1, test_abatch_1)
+                # get predition loss using second half
+                data_batch_2 = get_batch(test_2, indice, device)
+                test_abatch_2 = get_batch(test_a2, indice, device)
+                sums_2 = data_batch_2.sum(1).unsqueeze(1)
+                res = torch.mm(phi, beta)
+                preds = torch.mm(bsz_theta, res)
+                # preds = F.softmax(preds, dim=1)  # softmax over vocabulary dimension
+                almost_zeros = torch.full_like(preds, 1e-6)
+                preds = preds.add(almost_zeros)
+                preds = torch.log(preds)
+                recon_loss = -(preds * data_batch_2).sum(1)
+                loss = recon_loss / sums_2.squeeze()
+                loss = np.nanmean(loss.cpu().numpy())
+                acc_loss += loss
+                cnt += 1
+            cur_loss = acc_loss / cnt
+            ppl_dc = round(math.exp(cur_loss), 1)
+            print('*' * 100)
+            print('{} Doc Completion PPL: {}'.format(source.upper(), ppl_dc))
+            print('*' * 100)
+            if tc or td:
+                beta = beta.data.cpu().numpy()
+                if tc:
+                    print('Computing topic coherence...')
+                    get_topic_coherence(beta, training_set, vocabulary)
+                if td:
+                    print('Computing topic diversity...')
+                    get_topic_diversity(beta, 25)
+            return ppl_dc
