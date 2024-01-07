@@ -95,10 +95,7 @@ class EATM(nn.Module):
 
         input_x : one-hot vector of authors in size bsz * x_num_classes
         """
-        input_x = input_x.cpu()
-        x_sum = input_x.sum(1)
-        bsz_theta = [input_x[i] / x_sum[i] for i in range(len(x_sum))]
-        bsz_theta = torch.from_numpy(np.array(bsz_theta)).to(device)
+        bsz_theta = input_x
         # size in bsz_size * x_num_classes
         return bsz_theta
 
